@@ -2,282 +2,254 @@ import streamlit as st
 import re
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from difflib import SequenceMatcher
 
 st.set_page_config(
-    page_title="Northeastern to ImprintID Auto Matcher",
-    page_icon="⚡",
+    page_title="Northeastern to ImprintID Product Matcher",
+    page_icon="🎯",
     layout="wide"
 )
 
-st.title("⚡ Northeastern ➔ ImprintID Auto Matcher")
-st.write("Northeastern URL enter karte hi ye title aur SKU extract karega, ImprintID par auto-search chalayega aur best matching product nikalega.")
+st.title("🎯 Northeastern ➔ ImprintID Product Matcher")
+st.write("Northeastern product URL se exact data nikal kar ImprintID catalog par live search aur smart matching karta hai.")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-class AutoSearchExtractor:
+class ProductEngine:
     @staticmethod
-    def extract_from_url_slug(url: str) -> dict:
-        clean_url = url.strip().rstrip("/")
-        parts = [p for p in clean_url.split("/") if p]
+    def parse_slug_info(url: str) -> dict:
+        clean = url.strip().rstrip("/")
+        parts = [p for p in clean.split("/") if p]
         sku = parts[-1] if parts else ""
         slug = parts[-2] if len(parts) >= 2 else parts[-1]
+        
         if slug.lower() in ["product", "item", "p", "details"]:
             slug = parts[-1]
-
-        cleaned_title = re.sub(r'[-_]', ' ', slug)
-        cleaned_title = re.sub(r'[^a-zA-Z0-9\s]', ' ', cleaned_title)
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title).strip()
-        return {"sku": sku, "title_slug": cleaned_title}
+            
+        title = re.sub(r'[-_]', ' ', slug)
+        title = re.sub(r'[^a-zA-Z0-9\s]', ' ', title)
+        title = re.sub(r'\s+', ' ', title).strip()
+        return {"sku": sku, "slug_title": title}
 
     @classmethod
-    def scrape_product(cls, url: str) -> dict:
-        meta = cls.extract_from_url_slug(url)
-        title, description, sku = "", "", meta["sku"]
+    def scrape_url(cls, url: str) -> dict:
+        info = cls.parse_slug_info(url)
+        title = ""
+        sku = info["sku"]
+        desc = ""
 
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=8)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                t_elem = soup.find('h1') or soup.find('title')
-                if t_elem:
-                    title = t_elem.get_text(strip=True)
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'html.parser')
+                
+                # Title
+                h1 = soup.find('h1') or soup.find('title')
+                if h1:
+                    title = h1.get_text(strip=True)
+                    # Clean website branding
+                    title = re.sub(r'\s*-\s*ImprintID.*$', '', title, flags=re.I)
+                    title = re.sub(r'\s*\|\s*Northeastern.*$', '', title, flags=re.I)
 
-                # SKU tag fetch
-                sku_tag = soup.find(string=re.compile(r'Item\s*#|SKU|Item\s*Number', re.I))
-                if sku_tag and sku_tag.parent:
-                    found = re.findall(r'[A-Za-z0-9\-]+', sku_tag.parent.get_text(strip=True))
-                    if found:
-                        sku = found[-1]
-
-                d_elem = soup.find('div', {'id': re.compile(r'description|details|specs', re.I)}) or \
-                         soup.find('div', {'class': re.compile(r'description|prod-details', re.I)})
+                # SKU Extraction
+                sku_match = soup.find(string=re.compile(r'Item\s*#|SKU\b|Item\s*Number', re.I))
+                if sku_match and sku_match.parent:
+                    raw_sku = sku_match.parent.get_text(" ", strip=True)
+                    tokens = re.findall(r'[A-Za-z0-9\-]+', raw_sku)
+                    if tokens:
+                        sku = tokens[-1]
+                        
+                # Description
+                d_elem = soup.find('div', {'class': re.compile(r'description|details|product-info', re.I)})
                 if d_elem:
-                    description = d_elem.get_text(" ", strip=True)
+                    desc = d_elem.get_text(" ", strip=True)
         except Exception:
             pass
 
-        final_title = title if title else meta["title_slug"]
+        final_title = title if title else info["slug_title"]
         return {
             "url": url,
             "sku": sku,
             "title": final_title,
-            "description": description[:400],
-            "full_text": f"{final_title} {description} {meta['title_slug']}".strip()
+            "description": desc[:300],
+            "full_text": f"{final_title} {desc} {info['slug_title']}".strip()
         }
 
     @classmethod
-    def get_search_queries(cls, ne_data: dict) -> list:
-        """Northeastern data se targeted search keywords generate karta hai"""
+    def get_search_keywords(cls, title: str, sku: str) -> list:
+        """Search query generation: Brand & filler words remove karke focused queries"""
+        stops = {"with", "and", "set", "for", "box", "color", "in", "w", "the", "a", "of"}
+        words = [w for w in re.findall(r'[a-zA-Z0-9]+', title) if w.lower() not in stops]
+        
         queries = []
+        if len(words) >= 2:
+            queries.append(" ".join(words[:3])) # e.g. "Wooden Pickleball Racket"
+            queries.append(words[0] + " " + words[1]) # e.g. "Wooden Pickleball"
         
-        # 1. Title ke starting 3-4 primary keywords (stop words hatakar)
-        raw_words = re.findall(r'[a-zA-Z0-9]+', ne_data["title"])
-        stop_words = {"with", "and", "set", "for", "box", "color", "in", "w"}
-        key_words = [w for w in raw_words if w.lower() not in stop_words]
-        if key_words:
-            queries.append(" ".join(key_words[:4]))
-            queries.append(" ".join(key_words[:2]))
+        # Digits from SKU (e.g. PKL-PBS11 -> PB011)
+        nums = re.findall(r'\d+', sku)
+        if nums:
+            n = nums[-1].lstrip("0")
+            if n:
+                queries.append(f"pb{n.zfill(3)}")
+                queries.append(f"pb{n}")
 
-        # 2. SKU digits search (e.g. PBS11 -> PB011)
-        digits = re.findall(r'\d+', ne_data["sku"])
-        if digits:
-            num = digits[-1].lstrip("0")
-            if num:
-                queries.append(f"PB{num.zfill(3)}")
-                queries.append(f"PB{num}")
-        
         return list(dict.fromkeys(queries))
 
     @classmethod
-    def search_imprintid_direct(cls, query: str) -> list:
-        """ImprintID website ke search results se product URLs parse karta hai"""
-        urls = set()
-        search_urls = [
-            f"https://www.imprintid.com/search?keyword={quote_plus(query)}",
-            f"https://www.imprintid.com/search?q={quote_plus(query)}"
-        ]
-        for s_url in search_urls:
+    def find_imprintid_urls(cls, queries: list) -> list:
+        """Dual search pipeline: ImprintID internal endpoint + Web Index fallback"""
+        found_urls = set()
+
+        for q in queries:
+            # Method 1: ImprintID internal search endpoint
             try:
-                resp = requests.get(s_url, headers=HEADERS, timeout=8)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    for a in soup.find_all('a', href=True):
-                        href = a['href']
-                        if "/product/" in href:
-                            if not href.startswith("http"):
-                                href = f"https://www.imprintid.com{href}" if href.startswith("/") else f"https://www.imprintid.com/{href}"
-                            urls.add(href.split("?")[0].rstrip("/"))
+                ep = f"https://www.imprintid.com/product/search/{quote_plus(q)}"
+                res = requests.get(ep, headers=HEADERS, timeout=6)
+                if res.status_code == 200:
+                    sp = BeautifulSoup(res.text, 'html.parser')
+                    for a in sp.find_all('a', href=True):
+                        h = a['href']
+                        if "/product/" in h and not "/product/search/" in h:
+                            full = h if h.startswith("http") else f"https://www.imprintid.com{h}"
+                            found_urls.add(full.split("?")[0].rstrip("/"))
             except Exception:
                 pass
-        return list(urls)
 
-    @classmethod
-    def search_duckduckgo_fallback(cls, query: str) -> list:
-        """Search engine fallback in case ImprintID search blocks requests"""
-        urls = set()
-        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus('site:imprintid.com/product/ ' + query)}"
-        try:
-            resp = requests.get(ddg_url, headers=HEADERS, timeout=8)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for a in soup.find_all('a', class_='result__url', href=True):
-                    href = a.get_text(strip=True)
-                    if "imprintid.com/product/" in href:
-                        if not href.startswith("http"):
-                            href = "https://" + href
-                        urls.add(href.split("?")[0].rstrip("/"))
-        except Exception:
-            pass
-        return list(urls)
+            # Method 2: DDG Web Search fallback (Direct link resolver)
+            if len(found_urls) < 4:
+                try:
+                    s_url = f"https://html.duckduckgo.com/html/?q={quote_plus('site:imprintid.com/product/ ' + q)}"
+                    res = requests.get(s_url, headers=HEADERS, timeout=6)
+                    if res.status_code == 200:
+                        sp = BeautifulSoup(res.text, 'html.parser')
+                        for a in sp.find_all('a', class_='result__url', href=True):
+                            text_url = a.get_text(strip=True)
+                            if "imprintid.com/product/" in text_url:
+                                full = text_url if text_url.startswith("http") else "https://" + text_url
+                                found_urls.add(full.split("?")[0].rstrip("/"))
+                except Exception:
+                    pass
 
-    @classmethod
-    def auto_fetch_imprintid_candidates(cls, ne_data: dict, max_candidates=6) -> list:
-        """Automated pipeline to fetch candidate URLs"""
-        candidates = set()
-        search_queries = cls.get_search_queries(ne_data)
-
-        for q in search_queries:
-            # First try direct on-site search
-            found = cls.search_imprintid_direct(q)
-            for u in found:
-                candidates.add(u)
-            
-            # Agar direct search me nahi mile toh fallback use karo
-            if len(candidates) < 2:
-                ddg_found = cls.search_duckduckgo_fallback(q)
-                for u in ddg_found:
-                    candidates.add(u)
-
-            if len(candidates) >= max_candidates:
+            if len(found_urls) >= 8:
                 break
 
-        return list(candidates)[:max_candidates]
-
-
-class ProductMatcher:
-    @staticmethod
-    def clean(text: str) -> str:
-        text = text.lower()
-        text = re.sub(r'[^a-z0-9\s]', ' ', text)
-        return re.sub(r'\s+', ' ', text).strip()
+        return list(found_urls)
 
     @classmethod
-    def extract_sku_core(cls, sku: str):
-        numbers = re.findall(r'\d+', sku)
-        num_core = numbers[-1].lstrip('0') if numbers else ""
-        return num_core
+    def match_score(cls, ne_prod: dict, imp_prod: dict) -> float:
+        # 1. Core numeric match (e.g. PBS11 aur pb011 -> dono 11)
+        num1 = re.findall(r'\d+', ne_prod["sku"])
+        num2 = re.findall(r'\d+', imp_prod["sku"])
+        c1 = num1[-1].lstrip("0") if num1 else ""
+        c2 = num2[-1].lstrip("0") if num2 else ""
+        
+        sku_score = 1.0 if (c1 and c2 and c1 == c2) else 0.0
 
-    def sku_similarity(self, sku1: str, sku2: str) -> float:
-        n1 = self.extract_sku_core(sku1)
-        n2 = self.extract_sku_core(sku2)
-        if n1 and n2 and n1 == n2:
-            return 1.0
-        s1, s2 = self.clean(sku1), self.clean(sku2)
-        return SequenceMatcher(None, s1, s2).ratio() if s1 and s2 else 0.0
+        # 2. Key Title Words Overlap
+        w1 = set(re.findall(r'[a-zA-Z0-9]+', ne_prod["title"].lower()))
+        w2 = set(re.findall(r'[a-zA-Z0-9]+', imp_prod["title"].lower()))
+        overlap = len(w1 & w2) / min(len(w1), len(w2)) if w1 and w2 else 0.0
 
-    def token_overlap(self, t1: str, t2: str) -> float:
-        w1 = set(self.clean(t1).split())
-        w2 = set(self.clean(t2).split())
-        if not w1 or not w2:
-            return 0.0
-        return len(w1.intersection(w2)) / min(len(w1), len(w2))
+        # 3. Fuzzy Sequence Match
+        fuzzy = SequenceMatcher(None, ne_prod["title"].lower(), imp_prod["title"].lower()).ratio()
 
-    def calculate_score(self, p_ne: dict, p_imp: dict) -> float:
-        sku_score = self.sku_similarity(p_ne["sku"], p_imp["sku"])
-        token_score = self.token_overlap(p_ne["title"], p_imp["title"])
-        seq_score = SequenceMatcher(None, self.clean(p_ne["title"]), self.clean(p_imp["title"])).ratio()
-
-        txt1, txt2 = self.clean(p_ne["full_text"]), self.clean(p_imp["full_text"])
+        # 4. TF-IDF Cosine
         try:
-            vec = TfidfVectorizer(ngram_range=(1, 2)).fit([txt1, txt2])
-            mat = vec.transform([txt1, txt2])
-            tfidf_score = float(cosine_similarity(mat[0:1], mat[1:2])[0][0])
+            vec = TfidfVectorizer(ngram_range=(1, 2)).fit([ne_prod["full_text"], imp_prod["full_text"]])
+            m = vec.transform([ne_prod["full_text"], imp_prod["full_text"]])
+            tfidf = float(cosine_similarity(m[0:1], m[1:2])[0][0])
         except Exception:
-            tfidf_score = 0.0
+            tfidf = 0.0
 
-        final = (0.35 * sku_score) + (0.30 * token_score) + (0.20 * seq_score) + (0.15 * tfidf_score)
-        return round(final, 4)
+        # Weighted calculation
+        total = (0.35 * sku_score) + (0.35 * overlap) + (0.15 * fuzzy) + (0.15 * tfidf)
+        return round(total, 4)
 
 
-# --- Streamlit UI ---
-input_url = st.text_input(
-    "Northeastern Product URL:",
+# --- Streamlit Frontend ---
+ne_input = st.text_input(
+    "Enter Northeastern Product URL:",
     value="https://www.northeasternpromotions.com/product/Wooden-Pickleball-Set-w-Coolmax-Towel-Color-Box/PKL-PBS11"
 )
 
-auto_search = st.checkbox("Automatically search ImprintID for candidates (No manual URLs required)", value=True)
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    auto_crawl = st.checkbox("⚡ Auto-find candidates on ImprintID (Recommended)", value=True)
 
-manual_catalog = ""
-if not auto_search:
-    manual_catalog = st.text_area(
-        "Or Paste ImprintID Candidate URLs manually:",
-        value="https://www.imprintid.com/product/fiberglass-pickleball-racket-paddle-ball-set-w-carrying-bag/pb001\nhttps://www.imprintid.com/product/wooden-pickleball-racket-paddle-ball-set-w-coolmax-towel/pb011"
+with col_b:
+    custom_links = st.text_area(
+        "Or Manual Candidates (One URL per line):",
+        height=80,
+        disabled=auto_crawl,
+        placeholder="https://www.imprintid.com/product/wooden-pickleball-racket-paddle-ball-set-w-coolmax-towel/pb011"
     )
 
-if st.button("Find Match", type="primary"):
-    if not input_url.strip():
-        st.error("Kripya valid Northeastern URL enter karein.")
+if st.button("🚀 Find Matching Product", type="primary"):
+    if not ne_input.strip():
+        st.error("Please provide a valid Northeastern URL.")
     else:
-        with st.spinner("Extracting Northeastern product data..."):
-            extractor = AutoSearchExtractor()
-            matcher = ProductMatcher()
-            ne_data = extractor.scrape_product(input_url)
+        with st.spinner("Step 1: Extracting Northeastern metadata..."):
+            engine = ProductEngine()
+            ne_data = engine.scrape_url(ne_input)
 
-        st.info(f"**Target Title:** {ne_data['title']} | **Target SKU:** `{ne_data['sku']}`")
+        st.info(f"📍 **Target Title:** {ne_data['title']} | **Target SKU:** `{ne_data['sku']}`")
 
-        # Candidates determination
+        # Get ImprintID candidates
         candidates = []
-        if auto_search:
-            with st.spinner("Searching ImprintID dynamically using Title keywords & SKU..."):
-                candidates = extractor.auto_fetch_imprintid_candidates(ne_data)
+        if auto_crawl:
+            with st.spinner("Step 2: Querying ImprintID live catalog..."):
+                keywords = engine.get_search_keywords(ne_data["title"], ne_data["sku"])
+                st.caption(f"Generated Search Queries: `{', '.join(keywords)}`")
+                candidates = engine.find_imprintid_urls(keywords)
         else:
-            candidates = [c.strip() for c in manual_catalog.splitlines() if c.strip()]
+            candidates = [l.strip() for l in custom_links.splitlines() if l.strip()]
 
         if not candidates:
-            st.error("ImprintID par koi candidate products nahi mile. Kripya auto-search uncheck karke manually URLs provide karein.")
+            st.error("Koi ImprintID candidate nahi mila. Kripya URL verify karein ya manual URL daalein.")
         else:
-            st.write(f"🔍 Evaluated **{len(candidates)}** candidate(s) from ImprintID")
-            
-            with st.spinner("Scoring candidate matches..."):
-                scored_results = []
-                for c_url in candidates:
-                    imp_data = extractor.scrape_product(c_url)
-                    sc = matcher.calculate_score(ne_data, imp_data)
-                    scored_results.append((imp_data, sc))
+            st.success(f"Discovered **{len(candidates)}** ImprintID candidate(s). Evaluating scores...")
 
-                scored_results.sort(key=lambda x: x[1], reverse=True)
-                best_match, best_score = scored_results[0]
+            scored = []
+            with st.spinner("Step 3: Calculating similarity metrics..."):
+                for c_url in candidates:
+                    imp_data = engine.scrape_url(c_url)
+                    sc = engine.match_score(ne_data, imp_data)
+                    scored.append((imp_data, sc))
+
+                scored.sort(key=lambda x: x[1], reverse=True)
+                best_item, best_score = scored[0]
                 conf = round(best_score * 100, 2)
 
+            # Display match
             st.markdown("---")
-            if conf >= 65:
-                st.success(f"### 🎉 Match Found ({conf}% Match)")
-            elif conf >= 40:
-                st.warning(f"### ⚠️ Probable Match ({conf}% Match)")
+            if conf >= 60:
+                st.success(f"### ✅ Exact Match Found! ({conf}% Confidence)")
+            elif conf >= 35:
+                st.warning(f"### ⚠️ Probable Match Found ({conf}% Confidence)")
             else:
-                st.error(f"### ❌ Low Similarity Match ({conf}% Match)")
+                st.error(f"### ❌ Low Confidence Match ({conf}% Confidence)")
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Northeastern Source**")
-                st.write(f"- **Title:** {ne_data['title']}")
-                st.write(f"- **SKU:** `{ne_data['sku']}`")
-                st.caption(f"Source URL: {input_url}")
+            res1, res2 = st.columns(2)
+            with res1:
+                st.markdown("#### 🔹 Northeastern Product")
+                st.write(f"**Title:** {ne_data['title']}")
+                st.write(f"**SKU:** `{ne_data['sku']}`")
+                st.caption(ne_data['description'] or "No extra description text")
 
-            with c2:
-                st.markdown("**ImprintID Matched Product**")
-                st.write(f"- **Title:** {best_match['title']}")
-                st.write(f"- **SKU:** `{best_match['sku']}`")
-                st.markdown(f"- **Product Link:** [{best_match['url']}]({best_match['url']})")
+            with res2:
+                st.markdown("#### 🔸 Matched ImprintID Product")
+                st.write(f"**Title:** {best_item['title']}")
+                st.write(f"**SKU:** `{best_item['sku']}`")
+                st.markdown(f"**Direct Link:** [{best_item['url']}]({best_item['url']})")
 
-            with st.expander("Show all evaluated candidates"):
-                for cand, s in scored_results:
-                    st.write(f"- [{cand['title']}]({cand['url']}) — **{round(s * 100, 2)}%** (SKU: `{cand['sku']}`)")
+            with st.expander("📊 View All Candidate Scores"):
+                for item, score_val in scored:
+                    st.write(f"- [{item['title']}]({item['url']}) ➔ **{round(score_val * 100, 2)}%** (SKU: `{item['sku']}`)")
